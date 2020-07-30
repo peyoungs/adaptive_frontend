@@ -1,0 +1,495 @@
+<html>
+	<head>
+		<title>Particle Server</title>
+		<style>
+			body { margin: 0; }
+			canvas { display: block; }
+			#fps {
+    			position: absolute;
+    			bottom: 50px;
+    			left: 50px;
+    			z-index: 100;
+    			background-color:#ababab; 
+			}
+			form {
+				z-index: 100;
+				position: absolute;
+				background-color:#ababab; 
+			}
+		</style>
+	</head>
+	<body>
+        <script type="x-shader/x-vertex" id="vertexshader">
+			attribute float size;
+
+			varying vec3 vColor;
+
+			void main() {
+				vColor = color;
+				vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
+				gl_PointSize = size * ( 300.0 / -mvPosition.z );
+				gl_Position = projectionMatrix * mvPosition;
+			}
+		</script>
+
+		<script type="x-shader/x-fragment" id="fragmentshader">
+			uniform sampler2D pointTexture;
+
+			varying vec3 vColor;
+
+			void main() {
+				gl_FragColor = vec4( vColor, 1.0 );
+				gl_FragColor = gl_FragColor * texture2D( pointTexture, gl_PointCoord );
+			}
+		</script>
+
+		<script type="module">
+			import * as THREE from './node_modules/three/src/Three.js';
+
+			import { OrbitControls } from './node_modules/three/examples/jsm/controls/OrbitControls.js';
+
+			var renderer, scene, camera, controls, animationId;
+
+			var isPlaying = true;
+			var stepFrame = false;
+
+			var particleSystem, uniforms, geometry, bufferGeometry;
+
+			var mouse, raycaster;
+
+			const rootHostURL = 'http://localhost:8080/Server'
+			const hostPort = 8080;
+
+			const maxParticles = 50000;
+
+			var physicsFrameTime = 0, lastPhysicsFrameLoop = new Date;
+			var drawFrameTime = 0, lastDrawFrameLoop = new Date;
+
+			var worldRatio = 0.5;
+			var particleSize = 2;
+
+			var physicsGeometry;
+			var lastPhysicsFrame;
+			var currentSession;
+			
+			init();
+
+			function begin() {
+				currentSession = Math.random().toString(10).substr(2, 6);
+
+				var numWorkers = parseInt(document.getElementById( 'numWorkers' ).value, 10);
+
+				var numParticles = numWorkers;
+
+				var space = document.getElementById( 'chunkSpace' ).value;
+				var segments = document.getElementById( 'numChunks' ).value;
+
+				var cohesDist = document.getElementById( 'cohesionDistance' ).value;
+				var cohesWght = document.getElementById( 'cohesionWeight' ).value;
+				var alignDist = document.getElementById( 'alignDistance' ).value;
+				var alignWght = document.getElementById( 'alignWeight' ).value;
+				var sepDist = document.getElementById( 'sepDistance' ).value;
+				var sepWght = document.getElementById( 'sepWeight' ).value;
+				var moveVel = document.getElementById( 'moveVelocity' ).value;
+				var steerVel = document.getElementById( 'steerVelocity' ).value;
+				
+				fetch(rootHostURL + "/init", {
+                    method: 'POST', 
+                    mode: 'cors',
+                    cache: 'no-cache',
+                    headers: {
+						'Content-Type': 'application/octet-stream',
+                    },
+                    redirect: 'follow', 
+                    referrerPolicy: 'no-referrer',
+					body: 
+					`
+					{
+						"sessionId": "${currentSession}",
+						"workers": "${numWorkers}",
+						"space": "${space}",
+						"segments": "${segments}",
+						"cohesion": {
+							"distance":"${cohesDist}",
+							"weight":"${cohesWght}"
+						},
+						"alignment": {
+							"distance":"${alignDist}",
+							"weight":"${alignWght}"
+						},
+						"separation": {
+							"distance":"${sepDist}",
+							"weight":"${sepWght}"
+						},
+						"move": {
+							"velocity":"${moveVel}",
+							"steering":"${steerVel}"
+						}
+					}
+					`
+                }).then(resp => {
+					if (resp.status != 200) {
+						throw new Error('Invalid response from server ' + resp.status);
+					}
+
+					let reader = resp.body.getReader();
+
+					var colors = [];
+
+					for ( var i = 0; i < maxParticles; i ++ ) {
+						var color = new THREE.Color();
+						color.setHSL( Math.random(), 1.0, 0.5 );
+						colors.push( color.r, color.g, color.b);
+					}
+
+					geometry.setAttribute( 'color', new THREE.Float32BufferAttribute( colors, 3 ) );
+
+					updatePhysicsResponse(reader).catch(error => {
+                        console.error('There has been a problem with your fetch operation:', error);
+                    }).then(updatePhysics);
+				}).catch(error => {
+					console.error('There has been a problem with your fetch operation:', error);
+				});
+			}
+
+			function init() {
+				scene = new THREE.Scene();
+
+				var camGroup = new THREE.Object3D();
+				camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 75000);
+				camera.position.z = 100;
+				camGroup.add(camera);
+
+				scene.add(camGroup);
+
+				uniforms = {
+					pointTexture: { value: new THREE.TextureLoader().load( "images/point.png" ) }
+				};
+
+				var shaderMaterial = new THREE.ShaderMaterial( {
+					uniforms: uniforms,
+					vertexShader: document.getElementById( 'vertexshader' ).textContent,
+					fragmentShader: document.getElementById( 'fragmentshader' ).textContent,
+
+					blending: THREE.AdditiveBlending,
+					depthTest: false,
+					transparent: true,
+					vertexColors: true
+				} );
+
+				geometry = new THREE.BufferGeometry();
+
+				var colors = [];
+				var sizes = [];
+				var positions = [];
+
+				for ( var i = 0; i < maxParticles; i ++ ) {
+					positions.push(0);
+					positions.push(0);
+					positions.push(0);
+
+					var color = new THREE.Color();
+
+					color.setHSL( 1.0, 1.0, 1.0 );
+                	colors.push( color.r, color.g, color.b);
+
+					sizes.push( particleSize );
+				}
+
+				geometry.setAttribute( 'position', new THREE.Float32BufferAttribute( positions, 3 ));
+				geometry.setAttribute( 'color', new THREE.Float32BufferAttribute( colors, 3 ) );
+				geometry.setAttribute( 'size', new THREE.Float32BufferAttribute( sizes, 1 ) );
+
+				physicsGeometry = geometry.clone();
+
+				particleSystem = new THREE.Points( geometry, shaderMaterial );
+
+				scene.add( particleSystem );
+
+				renderer = new THREE.WebGLRenderer( );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+				controls = new OrbitControls( camera, renderer.domElement );
+				controls.update();
+
+				var container = document.getElementById( 'container' );
+				container.appendChild( renderer.domElement );
+
+				mouse = new THREE.Vector2();
+				raycaster = new THREE.Raycaster();
+    			// This requires scale to match
+    			raycaster.params.Points.threshold = 7500; 
+
+				renderer.domElement.addEventListener("click", event => {
+					event.preventDefault();
+					mouse.x =  ( event.clientX / renderer.domElement.width  ) * 2 - 1;
+					mouse.y = -( event.clientY / renderer.domElement.height ) * 2 + 1;
+
+					raycaster.setFromCamera( mouse, camera );
+					var intersects = raycaster.intersectObject( particleSystem, true );
+					if (intersects.length > 0) {
+						intersects = intersects.sort( function( a, b ) {
+							return a.distanceToRay - b.distanceToRay;
+						});
+						debugParticle(intersects[0]);
+					}
+				}, true);				
+
+				window.addEventListener( 'resize', () => {
+					camera.aspect = window.innerWidth / window.innerHeight;
+					camera.updateProjectionMatrix();
+
+					renderer.setSize( window.innerWidth, window.innerHeight );
+				}, false );
+
+				document.addEventListener('keyup', event => {
+				    if (event.code === 'Space') {
+						isPlaying = !isPlaying;
+						lastPhysicsFrame = new Date();
+						clearTimeout(activePhysicsTimeout);
+						updatePhysics();
+					}
+					if (event.code === 'KeyF') {
+						clearTimeout(activePhysicsTimeout);
+						stepFrame = true;
+						lastPhysicsFrame = new Date();
+						updatePhysics();
+  				    }
+					if (event.code === 'KeyN') {
+						clearTimeout(activePhysicsTimeout);
+						begin(); 
+  				    }
+				});
+
+				document.getElementById("begin_button").addEventListener("click", begin); 
+
+				reportStats();
+
+				lastPhysicsFrame = new Date();
+				isPlaying = false;
+				stepFrame = false;
+
+				begin();
+				requestAnimationFrame(animate);
+			}
+
+			function getRadioValue(name) { 
+            	var ele = document.getElementsByName(name); 
+              
+           		for(var i = 0; i < ele.length; i++) { 
+                	if(ele[i].checked) 
+                		return ele[i];
+            	} 
+
+        		return undefined;
+			}
+
+			function calcPhysicsFPS() {
+				var thisLoop = new Date;
+				var thisFrameTime = thisLoop - lastPhysicsFrameLoop;
+				physicsFrameTime += (thisFrameTime - physicsFrameTime) / filterStrength;
+				lastPhysicsFrameLoop = thisLoop;
+			}
+
+			function calcDrawFPS() {
+				var thisLoop = new Date;
+				var thisFrameTime = thisLoop - lastDrawFrameLoop;
+				drawFrameTime += (thisFrameTime - drawFrameTime) / filterStrength;
+				lastDrawFrameLoop = thisLoop;
+			}
+
+			function reportStats() {
+				// Report the fps only every second, to only lightly affect measurements
+				var fpsDisplay = document.getElementById('fps');
+				setInterval(function() {
+					fpsDisplay.innerHTML = "Session " + currentSession + " Draw " + (1000 / drawFrameTime).toFixed(1) + " fps\n"
+					 + "Physics " + (1000 / physicsFrameTime).toFixed(1) + " fps\nRunning " + isPlaying;
+				}, 1000);
+			}
+
+			function animate() {
+				//Make sure we run AFTER init
+				if (lastPhysParticles <= 0) {
+					setTimeout(animate, 1);
+				}
+				for (let i = 0; i < lastPhysParticles * 3; i++) {
+					geometry.attributes.position.array[i] = physicsGeometry.attributes.position.array[i] * worldRatio;
+				}
+
+				geometry.setDrawRange( 0, lastPhysParticles );
+				geometry.attributes.position.needsUpdate = true;
+
+				calcDrawFPS();
+
+				renderer.render( scene, camera );
+
+				requestAnimationFrame(animate);
+			}
+
+			function debugParticle(particle) {
+				fetch(rootHostURL + "/debug", {
+                    method: 'POST', 
+                    mode: 'cors',
+                    cache: 'no-cache',
+                    headers: {
+						'Content-Type': 'application/text',
+                    },
+                    redirect: 'follow', 
+                    referrerPolicy: 'no-referrer',
+					body: 
+					`
+					{
+						"sessionId": "${currentSession}",
+						"x": "${particle.point.x}",
+						"y": "${particle.point.y}",
+						"z": "${particle.point.z}"
+					}
+					`
+                }).then(resp => {
+					if (resp.status != 200) {
+						throw new Error('Invalid response from server ' + resp.status);
+					}
+					return resp.json();
+				}).then(data => {
+					console.log(data);
+				}).catch(error => {
+					console.error('There has been a problem with your fetch operation:', error);
+				});
+			}
+
+			var activePhysicsTimeout;
+			var lastPhysParticles;
+			const physTimeout = 75;
+
+            function updatePhysics() {
+				var startTime = new Date();
+				var deltaTime = startTime - lastPhysicsFrame;
+
+				if (stepFrame) {
+					stepFrame = false;
+					isPlaying = false;
+				}
+				else if (!isPlaying) {
+					activePhysicsTimeout = setTimeout(updatePhysics, physTimeout);
+					return;
+				};
+
+                fetch(rootHostURL + "/update", {
+                    method: 'POST', 
+                    mode: 'cors',
+                    cache: 'no-cache',
+                    headers: {
+                        'Content-Type': 'application/octet-stream',
+                    },
+                    redirect: 'follow', 
+                    referrerPolicy: 'no-referrer', 
+                    body: `{
+						"sessionId":"${currentSession}",
+						"deltaTime":"${deltaTime / 1000}"
+                    }`
+                }).then(resp => {
+					if (resp.status != 200) {
+						throw new Error('Invalid response from server ' + resp.statusText)
+					}
+
+					let reader = resp.body.getReader();
+
+					updatePhysicsResponse(reader).then(function() {
+						calcPhysicsFPS();
+
+						lastPhysicsFrame = new Date();
+
+						activePhysicsTimeout = setTimeout(updatePhysics, physTimeout);
+					}).catch(error => {
+						console.error('Fetch Physics Initialize error:', error);
+					});
+				}).catch(error => {
+					console.error('Fetch Physics Initialize error:', error);
+				});
+			}
+			
+			function updatePhysicsResponse(reader) {
+				var positions = physicsGeometry.attributes.position.array;
+				var num = 0;
+				return reader.read().then(function process({ done, value }) {
+					if (done) {
+						return;
+					}
+
+					var buff = new ArrayBuffer(4); //4 bytes
+					let dataview = new DataView(buff);
+					for (let valueNdx = 0; valueNdx < value.length; valueNdx += 16) {
+						var i = assembleInt(dataview, value, valueNdx);
+						var x = assembleFloat(dataview, value, valueNdx + 4);
+						var y = assembleFloat(dataview, value, valueNdx + 8);
+						var z = assembleFloat(dataview, value, valueNdx + 12);
+
+						positions[i * 3 + 0] = x;
+						positions[i * 3 + 1] = y;
+						positions[i * 3 + 2] = z;
+
+						num++;
+					}
+
+					return reader.read().then(process);
+				}).then(() => {lastPhysParticles = num;}).catch(error => {
+					console.error('Fetch Physics Update error:', error);
+				});
+			}
+
+            function assembleInt(dataview, value, i) {
+                dataview.setUint8(0, value[i]);
+                dataview.setUint8(1, value[i + 1]);
+                dataview.setUint8(2, value[i + 2]);
+                dataview.setUint8(3, value[i + 3]);
+                return dataview.getInt32(0);
+            }
+
+			function assembleFloat(dataview, value, i) {
+                dataview.setUint8(0, value[i]);
+                dataview.setUint8(1, value[i + 1]);
+                dataview.setUint8(2, value[i + 2]);
+                dataview.setUint8(3, value[i + 3]);
+                return dataview.getFloat32(0);
+            }
+        </script>
+        
+		<div id="container"/>
+
+		<div>
+			<form>
+				Num Workers:
+				<input id="numWorkers" class="text_input" type="text" value="5000">
+				<br/>
+				Cohesion Distance:
+				<input id="cohesionDistance" class="text_input" type="text" value="25">
+				Cohesion Weight:
+				<input id="cohesionWeight" class="text_input" type="text" value="1">
+				<br/>
+				Align Distance:
+				<input id="alignDistance" class="text_input" type="text" value="25">
+				Align Weight:
+				<input id="alignWeight" class="text_input" type="text" value="1">
+				<br/>
+				Separation Distance:
+				<input id="sepDistance" class="text_input" type="text" value="15">
+				Separation Weight:
+				<input id="sepWeight" class="text_input" type="text" value="1.5">
+				<br/>
+				Move Velocity:
+				<input id="moveVelocity" class="text_input" type="text" value="3">
+				Steer Velocity:
+				<input id="steerVelocity" class="text_input" type="text" value="0.5">
+				<br/>
+				Chunk Space:
+				<input id="chunkSpace" class="text_input" type="text" value="50">
+				Chunk Depth:
+				<input id="numChunks" class="text_input" type="text" value="3">
+				<br/>			
+				<button id="begin_button" type="button" value="Submit">Submit</button>
+			</form>
+		</div>
+		<div id="fps"/>
+	</body>
+</html>
